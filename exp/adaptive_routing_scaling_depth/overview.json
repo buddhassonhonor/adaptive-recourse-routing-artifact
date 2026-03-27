@@ -1,0 +1,39 @@
+{
+  "datasets": [
+    "adult",
+    "german",
+    "bank"
+  ],
+  "seeds": [
+    7
+  ],
+  "depths": [
+    2,
+    3,
+    4,
+    5
+  ],
+  "settings": [
+    "in_domain",
+    "covariate_shift",
+    "exemplar_mismatch",
+    "subgroup_shift"
+  ],
+  "constraints": [
+    "r1_all_mutable",
+    "r2_realistic"
+  ],
+  "alpha_grid": [
+    0.25,
+    0.5,
+    0.75,
+    0.9,
+    1.0
+  ],
+  "n_query_rows": 45136,
+  "n_tuning_rows": 24,
+  "n_subgroup_rows": 3360,
+  "n_disparity_rows": 1008,
+  "exp_dir": "D:\\NATURE-SCIENCE\\nature1\\exp\\adaptive_routing_scaling_depth",
+  "fig_dir": "D:\\NATURE-SCIENCE\\nature1\\figures\\adaptive_routing_scaling_depth"
+}

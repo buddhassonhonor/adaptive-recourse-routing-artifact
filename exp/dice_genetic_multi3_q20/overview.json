@@ -1,0 +1,19 @@
+{
+  "datasets": [
+    "adult",
+    "german",
+    "bank"
+  ],
+  "seeds": [
+    7,
+    13,
+    19
+  ],
+  "depths": [
+    3
+  ],
+  "max_rows": 600,
+  "max_queries_per_cell": 20,
+  "dice_method": "genetic",
+  "n_query_rows": 1276
+}
