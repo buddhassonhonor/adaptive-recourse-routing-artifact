@@ -15,6 +15,13 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 
 
+METHOD_LABELS = {
+    "fixed_blend": "Fixed blend",
+    "learned_router": "Learned router",
+    "utility_router_guarded": "Guarded router",
+}
+
+
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -128,10 +135,13 @@ def plot_subgroup_gap(disparity_df: pd.DataFrame, fig_dir: Path, methods: list[s
     if part.empty:
         return
     agg = part.groupby(["constraint", "method"], as_index=False)["regret_gap"].mean()
-    pivot = agg.pivot(index="method", columns="constraint", values="regret_gap")
-    pivot.plot(kind="bar", figsize=(10, 6))
+    agg["method_label"] = agg["method"].map(lambda x: METHOD_LABELS.get(x, x))
+    pivot = agg.pivot(index="method_label", columns="constraint", values="regret_gap")
+    ax = pivot.plot(kind="bar", figsize=(11, 6), rot=0)
+    ax.set_xlabel("Method")
     plt.ylabel("Mean subgroup regret gap")
     plt.title("Subgroup Disparity")
+    plt.legend(title="Constraint", ncol=2, loc="upper left")
     plt.tight_layout()
     plt.savefig(fig_dir / "subgroup_regret_gap.png", dpi=100)
     plt.close()

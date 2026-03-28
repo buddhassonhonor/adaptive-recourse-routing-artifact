@@ -9,9 +9,16 @@
 !scripts/run_adaptive_routing_experiments.py
 !scripts/run_dice_baselines.py
 !scripts/run_tree_milp_baseline.py
+!scripts/analyze_fix3_results.py
 !exp/
 !exp/adaptive_routing_guarded_multi3_merged/
 !exp/adaptive_routing_guarded_multi3_merged/**
+!exp/adaptive_routing_constraint_sweep_v1_fix3/
+!exp/adaptive_routing_constraint_sweep_v1_fix3/**
+!exp/adaptive_routing_model_sweep_v1_fix3/
+!exp/adaptive_routing_model_sweep_v1_fix3/**
+!exp/adaptive_routing_cascade_v1_fix6/
+!exp/adaptive_routing_cascade_v1_fix6/**
 !exp/dice_baseline_multi3_q20/
 !exp/dice_baseline_multi3_q20/**
 !exp/dice_genetic_multi3_q20/

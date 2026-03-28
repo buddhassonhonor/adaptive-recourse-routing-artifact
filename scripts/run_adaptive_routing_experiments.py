@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyClassifier, DummyRegressor
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
@@ -25,6 +25,11 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.tree import DecisionTreeClassifier
+
+try:
+    import pulp
+except ImportError:  # pragma: no cover - optional dependency
+    pulp = None
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EXP_NAME = "adaptive_routing"
@@ -43,6 +48,7 @@ ALPHA_GRID = [0.25, 0.50, 0.75, 0.90, 1.00]
 DEFAULT_SEEDS = [7, 13, 19]
 DEFAULT_DEPTHS = [3, 5]
 SETTINGS = ["in_domain", "covariate_shift", "exemplar_mismatch", "subgroup_shift"]
+DEFAULT_MODEL_FAMILIES = ["tree"]
 FULL_FEATURE_ORDER = [
     "d_proj",
     "d_nn",
@@ -86,12 +92,30 @@ R1_ALL_MUTABLE = ConstraintSetting(
     enforce_onehot=False,
     enforce_monotonic=False,
 )
+R1_IMMUTABLE_ONLY = ConstraintSetting(
+    name="r1_immutable_only",
+    enforce_immutables=True,
+    enforce_onehot=False,
+    enforce_monotonic=False,
+)
+R1_STRUCTURAL = ConstraintSetting(
+    name="r1_structural",
+    enforce_immutables=True,
+    enforce_onehot=True,
+    enforce_monotonic=False,
+)
 R2_REALISTIC = ConstraintSetting(
     name="r2_realistic",
     enforce_immutables=True,
     enforce_onehot=True,
     enforce_monotonic=True,
 )
+CONSTRAINT_REGIMES = [
+    R1_ALL_MUTABLE,
+    R1_IMMUTABLE_ONLY,
+    R1_STRUCTURAL,
+    R2_REALISTIC,
+]
 
 
 @dataclass(frozen=True)
@@ -141,7 +165,17 @@ class ActionResult:
     runtime_sec: float
 
 
-def clone_action_result(result: ActionResult, method: str, alpha: float) -> ActionResult:
+def get_constraint_settings(names: Sequence[str]) -> List[ConstraintSetting]:
+    name_map = {c.name: c for c in CONSTRAINT_REGIMES}
+    out: List[ConstraintSetting] = []
+    for name in names:
+        if name not in name_map:
+            raise ValueError(f"unknown constraint regime: {name}")
+        out.append(name_map[name])
+    return out
+
+
+def clone_action_result(result: ActionResult, method: str, alpha: float, runtime_sec: Optional[float] = None) -> ActionResult:
     return ActionResult(
         method=method,
         alpha=float(alpha),
@@ -153,7 +187,7 @@ def clone_action_result(result: ActionResult, method: str, alpha: float) -> Acti
         sparsity=result.sparsity,
         plausibility=result.plausibility,
         utility=result.utility,
-        runtime_sec=result.runtime_sec,
+        runtime_sec=result.runtime_sec if runtime_sec is None else float(runtime_sec),
     )
 
 
@@ -267,6 +301,36 @@ def load_bank() -> Tuple[pd.DataFrame, np.ndarray]:
     return x.reset_index(drop=True), y
 
 
+def load_compas() -> Tuple[pd.DataFrame, np.ndarray]:
+    df = pd.read_csv(DATA_ROOT / "compas" / "compas-scores-two-years.csv")
+    keep = df.copy()
+    keep = keep[
+        keep["days_b_screening_arrest"].between(-30, 30, inclusive="both")
+        & (keep["is_recid"] != -1)
+        & (keep["c_charge_degree"] != "O")
+        & keep["score_text"].notna()
+    ].reset_index(drop=True)
+    cols = [
+        "sex",
+        "age",
+        "age_cat",
+        "race",
+        "juv_fel_count",
+        "juv_misd_count",
+        "juv_other_count",
+        "priors_count",
+        "c_charge_degree",
+    ]
+    x = keep[cols].copy()
+    for col in ["age", "juv_fel_count", "juv_misd_count", "juv_other_count", "priors_count"]:
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+    valid_mask = x.notna().all(axis=1)
+    x = x.loc[valid_mask].reset_index(drop=True)
+    # Positive label denotes the desirable non-recidivism outcome.
+    y = (1 - keep.loc[valid_mask, "two_year_recid"].astype(int)).astype(int).to_numpy()
+    return x, y
+
+
 def build_datasets() -> Dict[str, DatasetConfig]:
     return {
         "adult": DatasetConfig(
@@ -295,6 +359,15 @@ def build_datasets() -> Dict[str, DatasetConfig]:
             monotone_increase_raw=("balance",),
             monotone_decrease_raw=(),
             subgroup_raw="marital",
+        ),
+        "compas": DatasetConfig(
+            name="compas",
+            loader=load_compas,
+            drop_cols=(),
+            immutable_raw=("age", "sex", "race"),
+            monotone_increase_raw=(),
+            monotone_decrease_raw=(),
+            subgroup_raw="race",
         ),
     }
 
@@ -359,6 +432,52 @@ def build_preprocessor(train_df: pd.DataFrame) -> TransformBundle:
 
 def transform_df(bundle: TransformBundle, df: pd.DataFrame) -> np.ndarray:
     return np.asarray(bundle.preprocessor.transform(df), dtype=float)
+
+
+def fit_target_model(model_family: str, train_x: np.ndarray, y_train: np.ndarray, depth: int, seed: int):
+    if model_family == "tree":
+        model = DecisionTreeClassifier(
+            max_depth=int(depth),
+            min_samples_leaf=20,
+            class_weight="balanced",
+            random_state=int(seed),
+        )
+    elif model_family == "logistic":
+        model = LogisticRegression(
+            max_iter=2000,
+            class_weight="balanced",
+            random_state=int(seed),
+        )
+    elif model_family == "rf":
+        model = RandomForestClassifier(
+            n_estimators=300,
+            max_depth=max(int(depth) + 2, 6),
+            min_samples_leaf=8,
+            class_weight="balanced_subsample",
+            random_state=int(seed),
+            n_jobs=-1,
+        )
+    elif model_family == "hgbt":
+        model = HistGradientBoostingClassifier(
+            max_depth=max(int(depth), 3),
+            max_iter=250,
+            random_state=int(seed),
+        )
+    else:
+        raise ValueError(f"unknown model family: {model_family}")
+    model.fit(train_x, y_train)
+    return model
+
+
+def fit_route_tree(train_x: np.ndarray, route_labels: np.ndarray, depth: int, seed: int) -> DecisionTreeClassifier:
+    route_tree = DecisionTreeClassifier(
+        max_depth=int(depth),
+        min_samples_leaf=20,
+        class_weight="balanced",
+        random_state=int(seed) + 101,
+    )
+    route_tree.fit(train_x, route_labels)
+    return route_tree
 
 
 def get_leaf_boxes(clf: DecisionTreeClassifier) -> Dict[int, Dict[str, Dict[int, float]]]:
@@ -661,6 +780,137 @@ def nearest_train_distance(bundle: TransformBundle, x: np.ndarray, positive_only
     return float(np.mean(dists[0]))
 
 
+def feature_bounds(bundle: TransformBundle) -> Dict[int, Tuple[Optional[float], Optional[float]]]:
+    bounds: Dict[int, Tuple[Optional[float], Optional[float]]] = {}
+    train_x = bundle.train_x
+    for idx in range(train_x.shape[1]):
+        lo = float(np.min(train_x[:, idx])) - 1.0
+        hi = float(np.max(train_x[:, idx])) + 1.0
+        bounds[idx] = (lo, hi)
+    for idxs in bundle.onehot_groups.values():
+        for idx in idxs:
+            bounds[idx] = (0.0, 1.0)
+    return bounds
+
+
+def build_leaf_milp_candidate(
+    base_query: np.ndarray,
+    leaf_box: Dict[str, Dict[int, float]],
+    bundle: TransformBundle,
+    config: DatasetConfig,
+    constraints: ConstraintSetting,
+    bounds: Dict[int, Tuple[Optional[float], Optional[float]]],
+    time_limit_sec: float,
+) -> Optional[np.ndarray]:
+    if pulp is None:
+        return None
+    prob = pulp.LpProblem("tree_milp_recourse", pulp.LpMinimize)
+    x_vars: Dict[int, object] = {}
+    d_vars: Dict[int, object] = {}
+    binary_idxs: set[int] = set()
+
+    for col, idxs in bundle.onehot_groups.items():
+        if constraints.enforce_immutables and col in config.immutable_raw:
+            continue
+        binary_idxs.update(int(idx) for idx in idxs)
+
+    for idx in range(len(base_query)):
+        lo, hi = bounds[idx]
+        if idx in binary_idxs:
+            x_vars[idx] = pulp.LpVariable(f"x_{idx}", lowBound=0.0, upBound=1.0, cat=pulp.LpBinary)
+        else:
+            x_vars[idx] = pulp.LpVariable(f"x_{idx}", lowBound=lo, upBound=hi, cat="Continuous")
+        d_vars[idx] = pulp.LpVariable(f"d_{idx}", lowBound=0.0, cat="Continuous")
+        base_val = float(base_query[idx])
+        prob += x_vars[idx] - base_val <= d_vars[idx]
+        prob += base_val - x_vars[idx] <= d_vars[idx]
+
+    for col in bundle.num_cols:
+        idx = bundle.raw_to_indices[col][0]
+        lo = lower_bound(leaf_box, idx)
+        hi = upper_bound(leaf_box, idx)
+        base_val = float(base_query[idx])
+        if constraints.enforce_immutables and col in config.immutable_raw:
+            prob += x_vars[idx] == base_val
+        else:
+            if math.isfinite(lo):
+                prob += x_vars[idx] >= lo
+            if math.isfinite(hi):
+                prob += x_vars[idx] <= hi
+            if constraints.enforce_monotonic:
+                if col in config.monotone_increase_raw:
+                    prob += x_vars[idx] >= base_val
+                if col in config.monotone_decrease_raw:
+                    prob += x_vars[idx] <= base_val
+
+    for col, idxs in bundle.onehot_groups.items():
+        if constraints.enforce_immutables and col in config.immutable_raw:
+            frozen = int(np.argmax(base_query[idxs]))
+            for pos, idx in enumerate(idxs):
+                prob += x_vars[idx] == float(pos == frozen)
+        elif constraints.enforce_onehot:
+            prob += pulp.lpSum(x_vars[idx] for idx in idxs) == 1.0
+        for idx in idxs:
+            lo = lower_bound(leaf_box, idx)
+            hi = upper_bound(leaf_box, idx)
+            if math.isfinite(lo):
+                prob += x_vars[idx] >= lo
+            if math.isfinite(hi):
+                prob += x_vars[idx] <= hi
+
+    prob += pulp.lpSum(d_vars.values())
+    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=float(time_limit_sec))
+    status = prob.solve(solver)
+    if pulp.LpStatus[status] != "Optimal":
+        return None
+
+    candidate = np.array([float(pulp.value(x_vars[idx])) for idx in range(len(base_query))], dtype=float)
+    if constraints.enforce_onehot:
+        for col, idxs in bundle.onehot_groups.items():
+            if constraints.enforce_immutables and col in config.immutable_raw:
+                continue
+            chosen = choose_onehot_vector(candidate, idxs, box=None)
+            if chosen is not None:
+                candidate[idxs] = chosen
+    return candidate
+
+
+def best_exact_candidate(
+    base_query: np.ndarray,
+    eval_model,
+    leaf_boxes: Dict[int, Dict[str, Dict[int, float]]],
+    positive_leaf_nodes: List[int],
+    bundle: TransformBundle,
+    config: DatasetConfig,
+    constraints: ConstraintSetting,
+    time_limit_sec: float,
+) -> Optional[np.ndarray]:
+    if pulp is None:
+        return None
+    bounds = feature_bounds(bundle)
+    best_candidate: Optional[np.ndarray] = None
+    best_cost = float("inf")
+    for leaf_id in positive_leaf_nodes:
+        candidate = build_leaf_milp_candidate(
+            base_query=base_query,
+            leaf_box=leaf_boxes[int(leaf_id)],
+            bundle=bundle,
+            config=config,
+            constraints=constraints,
+            bounds=bounds,
+            time_limit_sec=time_limit_sec,
+        )
+        if candidate is None:
+            continue
+        if int(eval_model.predict(candidate.reshape(1, -1))[0]) != 1:
+            continue
+        cost = float(np.sum(np.abs(candidate - base_query)))
+        if cost < best_cost:
+            best_cost = cost
+            best_candidate = candidate
+    return best_candidate
+
+
 def leaf_slack(candidate: np.ndarray, box: Dict[str, Dict[int, float]]) -> float:
     slacks: List[float] = []
     for idx in range(len(candidate)):
@@ -760,7 +1010,7 @@ def evaluate_candidate(
 
 def build_alpha_candidate(
     base_query: np.ndarray,
-    projection: ProjectionCandidate,
+    projection: Optional[ProjectionCandidate],
     exemplar: np.ndarray,
     alpha: float,
     bundle: TransformBundle,
@@ -769,6 +1019,8 @@ def build_alpha_candidate(
     clf: DecisionTreeClassifier,
     do_repair: bool = True,
 ) -> Optional[np.ndarray]:
+    if projection is None:
+        return None
     if alpha >= 1.0 - 1e-9:
         return projection.candidate.copy()
     candidate = alpha * projection.candidate + (1.0 - alpha) * exemplar
@@ -981,6 +1233,7 @@ def fit_learned_models(
 
     proj_targets = np.array([float(row["alpha_results"][1.0].utility) for row in calib_rows], dtype=float)
     blend_targets = np.array([float(row["alpha_results"][fixed_alpha].utility) for row in calib_rows], dtype=float)
+    oracle_margins = np.abs(proj_targets - blend_targets)
 
     routers = {
         "main": fit_router_model(calib_rows, y_router, FULL_FEATURE_ORDER),
@@ -1009,6 +1262,7 @@ def fit_learned_models(
         "safe_utility_threshold": (
             float(np.quantile(best_utils, 0.85) + ABSTAIN_BUFFER) if best_utils else INVALID_PENALTY + ABSTAIN_BUFFER
         ),
+        "exact_margin_q25": float(np.quantile(oracle_margins, 0.25)) if len(oracle_margins) else 0.0,
     }
     return alpha_model, routers, utility_models, thresholds
 
@@ -1037,6 +1291,17 @@ def utility_route_prediction(
     pred_proj = float(utility_model_pair["projection"].predict(x)[0])
     pred_blend = float(utility_model_pair["blend"].predict(x)[0])
     return int(pred_proj <= pred_blend)
+
+
+def predict_route_utilities(
+    utility_model_pair: Dict[str, DummyRegressor | RandomForestRegressor],
+    feature_row: Dict[str, float],
+    feature_order: Sequence[str],
+) -> Tuple[float, float]:
+    x = sanitize_feature_matrix([feature_row], feature_order)
+    pred_proj = float(utility_model_pair["projection"].predict(x)[0])
+    pred_blend = float(utility_model_pair["blend"].predict(x)[0])
+    return pred_proj, pred_blend
 
 
 def nearest_grid_alpha(alpha: float) -> float:
@@ -1132,7 +1397,7 @@ def prepare_calibration_rows(
 
 def aggregate_results(df: pd.DataFrame) -> pd.DataFrame:
     return (
-        df.groupby(["dataset", "seed", "depth", "setting", "constraint", "method"], as_index=False)[
+        df.groupby(["dataset", "model_family", "seed", "depth", "setting", "constraint", "method"], as_index=False)[
             [
                 "valid",
                 "abstained",
@@ -1154,23 +1419,24 @@ def aggregate_results(df: pd.DataFrame) -> pd.DataFrame:
 
 def summarize_subgroups(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     subgroup_summary = (
-        df.groupby(["dataset", "seed", "depth", "setting", "constraint", "method", "subgroup"], as_index=False)[
+        df.groupby(["dataset", "model_family", "seed", "depth", "setting", "constraint", "method", "subgroup"], as_index=False)[
             ["valid", "abstained", "cost_l1", "regret", "route_accuracy"]
         ]
         .mean()
     )
     disparity_rows: List[Dict[str, object]] = []
-    for keys, part in subgroup_summary.groupby(["dataset", "seed", "depth", "setting", "constraint", "method"]):
+    for keys, part in subgroup_summary.groupby(["dataset", "model_family", "seed", "depth", "setting", "constraint", "method"]):
         if len(part) <= 1:
             continue
         disparity_rows.append(
             {
                 "dataset": keys[0],
-                "seed": keys[1],
-                "depth": keys[2],
-                "setting": keys[3],
-                "constraint": keys[4],
-                "method": keys[5],
+                "model_family": keys[1],
+                "seed": keys[2],
+                "depth": keys[3],
+                "setting": keys[4],
+                "constraint": keys[5],
+                "method": keys[6],
                 "n_subgroups": int(len(part)),
                 "valid_gap": float(part["valid"].max() - part["valid"].min()),
                 "cost_l1_gap": float(part["cost_l1"].max() - part["cost_l1"].min()),
@@ -1230,11 +1496,16 @@ def make_figures(summary_df: pd.DataFrame, fig_dir: Path) -> None:
 
 def run_experiment(
     dataset_names: Sequence[str],
+    model_families: Sequence[str],
+    constraint_settings: Sequence[ConstraintSetting],
     seeds: Sequence[int],
     depths: Sequence[int],
     max_rows: int,
     exp_dir: Path,
     fig_dir: Path,
+    enable_exact_cascade: bool = False,
+    include_exact_baseline: bool = False,
+    exact_time_limit_sec: float = 3.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
     dataset_map = build_datasets()
     query_rows: List[Dict[str, object]] = []
@@ -1266,314 +1537,453 @@ def run_experiment(
 
             bundle = build_preprocessor(train_df)
             for depth in depths:
-                clf = DecisionTreeClassifier(
-                    max_depth=int(depth),
-                    min_samples_leaf=20,
-                    class_weight="balanced",
-                    random_state=int(seed),
-                )
-                clf.fit(bundle.train_x, y_train)
-
-                train_pred = clf.predict(bundle.train_x)
-                pos_mask = train_pred == 1
-                if int(np.sum(pos_mask)) == 0:
-                    continue
-
-                pos_train_x = bundle.train_x[pos_mask]
-                pos_train_rows = train_df.iloc[np.where(pos_mask)[0]].reset_index(drop=True)
-                bundle.knn_pos = NearestNeighbors(n_neighbors=min(5, len(pos_train_x)))
-                bundle.knn_pos.fit(pos_train_x)
-
-                leaf_boxes = get_leaf_boxes(clf)
-                positive_leaf_nodes = get_positive_leaf_nodes(clf, leaf_boxes)
-                if not positive_leaf_nodes:
-                    continue
-
-                for constraints in [R1_ALL_MUTABLE, R2_REALISTIC]:
-                    calib_rows = prepare_calibration_rows(
-                        config=config,
-                        constraints=constraints,
-                        bundle=bundle,
-                        clf=clf,
-                        leaf_boxes=leaf_boxes,
-                        positive_leaf_nodes=positive_leaf_nodes,
-                        pos_train_x=pos_train_x,
-                        pos_train_rows=pos_train_rows,
-                        train_df_raw=train_df,
-                        calib_df_raw=val_df,
+                for model_family in model_families:
+                    eval_model = fit_target_model(
+                        model_family=model_family,
+                        train_x=bundle.train_x,
+                        y_train=y_train,
+                        depth=int(depth),
+                        seed=int(seed),
                     )
-                    if not calib_rows:
+                    train_pred = np.asarray(eval_model.predict(bundle.train_x), dtype=int)
+                    if len(np.unique(train_pred)) <= 1:
                         continue
 
-                    fixed_alpha = tune_fixed_alpha(calib_rows)
-                    alpha_model, router_models, utility_models, thresholds = fit_learned_models(
-                        calib_rows, fixed_alpha=fixed_alpha
-                    )
-                    tuning_rows.append(
-                        {
-                            "dataset": dataset_name,
-                            "seed": seed,
-                            "depth": depth,
-                            "constraint": constraints.name,
-                            "fixed_alpha": fixed_alpha,
-                            "rule_ood_q75": thresholds["rule_ood_q75"],
-                            "safe_utility_threshold": thresholds["safe_utility_threshold"],
-                            "n_calibration_queries": len(calib_rows),
-                        }
-                    )
+                    pos_mask = train_pred == 1
+                    if int(np.sum(pos_mask)) == 0:
+                        continue
 
-                    for setting in SETTINGS:
-                        eval_raw, retrieval_mode = apply_setting(setting, train_df, test_df, config)
-                        eval_x = transform_df(bundle, eval_raw)
-                        pred = clf.predict(eval_x)
-                        neg_idx = np.where(pred == 0)[0]
+                    pos_train_x = bundle.train_x[pos_mask]
+                    pos_train_rows = train_df.iloc[np.where(pos_mask)[0]].reset_index(drop=True)
+                    bundle.knn_pos = NearestNeighbors(n_neighbors=min(5, len(pos_train_x)))
+                    bundle.knn_pos.fit(pos_train_x)
 
-                        for idx in neg_idx:
-                            x0 = eval_x[int(idx)]
-                            row_raw = eval_raw.iloc[int(idx)]
-                            projection = best_projection_candidate(
-                                query_x=x0,
-                                clf=clf,
-                                leaf_boxes=leaf_boxes,
-                                positive_leaf_nodes=positive_leaf_nodes,
-                                bundle=bundle,
-                                config=config,
-                                constraints=constraints,
-                            )
-                            if projection is None:
-                                continue
+                    if model_family == "tree" and isinstance(eval_model, DecisionTreeClassifier):
+                        route_tree = eval_model
+                    else:
+                        route_tree = fit_route_tree(
+                            train_x=bundle.train_x,
+                            route_labels=train_pred,
+                            depth=int(depth),
+                            seed=int(seed),
+                        )
 
-                            exemplar = nearest_positive_exemplar(
-                                query_x=x0,
-                                query_row=row_raw,
-                                pos_x=pos_train_x,
-                                pos_rows=pos_train_rows,
-                                config=config,
-                                retrieval_mode=retrieval_mode,
-                            )
-                            neighbor_pool = positive_neighbor_pool(
-                                query_x=x0,
-                                query_row=row_raw,
-                                pos_x=pos_train_x,
-                                pos_rows=pos_train_rows,
-                                config=config,
-                                retrieval_mode=retrieval_mode,
-                                k=5,
-                            )
-                            features = compute_query_features(
-                                base_query=x0,
-                                projection=projection,
-                                exemplar=exemplar,
-                                bundle=bundle,
-                                config=config,
-                                clf=clf,
-                                fixed_alpha=fixed_alpha,
-                                constraints=constraints,
-                                leaf_boxes=leaf_boxes,
-                            )
+                    route_train_pred = np.asarray(route_tree.predict(bundle.train_x), dtype=int)
+                    if len(np.unique(route_train_pred)) <= 1 or int(np.sum(route_train_pred == 1)) == 0:
+                        continue
 
-                            oracle_results: Dict[float, ActionResult] = {}
-                            for alpha in ALPHA_GRID:
-                                start = time.perf_counter()
-                                candidate = build_alpha_candidate(
-                                    base_query=x0,
-                                    projection=projection,
-                                    exemplar=exemplar,
-                                    alpha=float(alpha),
+                    leaf_boxes = get_leaf_boxes(route_tree)
+                    positive_leaf_nodes = get_positive_leaf_nodes(route_tree, leaf_boxes)
+                    if not positive_leaf_nodes:
+                        continue
+
+                    for constraints in constraint_settings:
+                        calib_rows = prepare_calibration_rows(
+                            config=config,
+                            constraints=constraints,
+                            bundle=bundle,
+                            clf=eval_model,
+                            leaf_boxes=leaf_boxes,
+                            positive_leaf_nodes=positive_leaf_nodes,
+                            pos_train_x=pos_train_x,
+                            pos_train_rows=pos_train_rows,
+                            train_df_raw=train_df,
+                            calib_df_raw=val_df,
+                        )
+                        if not calib_rows:
+                            continue
+
+                        fixed_alpha = tune_fixed_alpha(calib_rows)
+                        alpha_model, router_models, utility_models, thresholds = fit_learned_models(
+                            calib_rows, fixed_alpha=fixed_alpha
+                        )
+                        tuning_rows.append(
+                            {
+                                "dataset": dataset_name,
+                                "model_family": model_family,
+                                "seed": seed,
+                                "depth": depth,
+                                "constraint": constraints.name,
+                                "fixed_alpha": fixed_alpha,
+                                "rule_ood_q75": thresholds["rule_ood_q75"],
+                                "safe_utility_threshold": thresholds["safe_utility_threshold"],
+                                "exact_margin_q25": thresholds["exact_margin_q25"],
+                                "n_calibration_queries": len(calib_rows),
+                            }
+                        )
+
+                        for setting in SETTINGS:
+                            eval_raw, retrieval_mode = apply_setting(setting, train_df, test_df, config)
+                            eval_x = transform_df(bundle, eval_raw)
+                            pred = eval_model.predict(eval_x)
+                            neg_idx = np.where(pred == 0)[0]
+
+                            for idx in neg_idx:
+                                x0 = eval_x[int(idx)]
+                                row_raw = eval_raw.iloc[int(idx)]
+                                projection = best_projection_candidate(
+                                    query_x=x0,
+                                    clf=route_tree,
+                                    leaf_boxes=leaf_boxes,
+                                    positive_leaf_nodes=positive_leaf_nodes,
                                     bundle=bundle,
                                     config=config,
                                     constraints=constraints,
-                                    clf=clf,
                                 )
-                                oracle_results[float(alpha)] = evaluate_candidate(
-                                    method=f"alpha_{alpha:.2f}",
-                                    alpha=float(alpha),
+                                if projection is None:
+                                    continue
+
+                                exemplar = nearest_positive_exemplar(
+                                    query_x=x0,
+                                    query_row=row_raw,
+                                    pos_x=pos_train_x,
+                                    pos_rows=pos_train_rows,
+                                    config=config,
+                                    retrieval_mode=retrieval_mode,
+                                )
+                                neighbor_pool = positive_neighbor_pool(
+                                    query_x=x0,
+                                    query_row=row_raw,
+                                    pos_x=pos_train_x,
+                                    pos_rows=pos_train_rows,
+                                    config=config,
+                                    retrieval_mode=retrieval_mode,
+                                    k=5,
+                                )
+                                features = compute_query_features(
                                     base_query=x0,
-                                    candidate=candidate,
+                                    projection=projection,
+                                    exemplar=exemplar,
                                     bundle=bundle,
-                                    clf=clf,
-                                    start_time=start,
+                                    config=config,
+                                    clf=eval_model,
+                                    fixed_alpha=fixed_alpha,
+                                    constraints=constraints,
+                                    leaf_boxes=leaf_boxes,
                                 )
-                            oracle_alpha = float(min(oracle_results.items(), key=lambda kv: kv[1].utility)[0])
-                            oracle_utility = float(oracle_results[oracle_alpha].utility)
-                            safe_threshold = float(thresholds["safe_utility_threshold"])
 
-                            learned_alpha = alpha_prediction(alpha_model, features)
-                            if (
-                                features["ood_score"] > thresholds["rule_ood_q75"]
-                                or features["d_proj"] <= 0.90 * max(features["d_nn"], 1e-9)
-                                or features["repair_needed"] > 0.5
-                            ):
-                                rule_alpha = 1.0
-                            else:
-                                rule_alpha = fixed_alpha
-                            router_alpha = (
-                                1.0 if router_prediction(router_models["main"], features, FULL_FEATURE_ORDER) == 1 else fixed_alpha
-                            )
-                            router_no_shift_alpha = (
-                                1.0 if router_prediction(router_models["no_shift"], features, NO_SHIFT_FEATURE_ORDER) == 1 else fixed_alpha
-                            )
-                            router_no_geometry_alpha = (
-                                1.0
-                                if router_prediction(router_models["no_geometry"], features, NO_GEOMETRY_FEATURE_ORDER) == 1
-                                else fixed_alpha
-                            )
-                            utility_router_alpha = (
-                                1.0
-                                if utility_route_prediction(utility_models["main"], features, FULL_FEATURE_ORDER) == 1
-                                else fixed_alpha
-                            )
-                            utility_router_no_shift_alpha = (
-                                1.0
-                                if utility_route_prediction(utility_models["no_shift"], features, NO_SHIFT_FEATURE_ORDER) == 1
-                                else fixed_alpha
-                            )
-                            utility_router_no_geometry_alpha = (
-                                1.0
-                                if utility_route_prediction(utility_models["no_geometry"], features, NO_GEOMETRY_FEATURE_ORDER) == 1
-                                else fixed_alpha
-                            )
-                            proj_valid = bool(oracle_results[1.0].valid)
-                            fixed_valid = bool(oracle_results[nearest_grid_alpha(fixed_alpha)].valid)
-                            utility_router_guarded_alpha = utility_router_alpha
-                            if abs(utility_router_guarded_alpha - 1.0) < 1e-9 and (not proj_valid) and fixed_valid:
-                                utility_router_guarded_alpha = fixed_alpha
-                            elif abs(utility_router_guarded_alpha - fixed_alpha) < 1e-9 and (not fixed_valid) and proj_valid:
-                                utility_router_guarded_alpha = 1.0
-                            nn_candidate = build_nn_candidate(
-                                base_query=x0,
-                                exemplar=exemplar,
-                                bundle=bundle,
-                                config=config,
-                                constraints=constraints,
-                            )
-                            knn_mean_candidate = build_knn_mean_candidate(
-                                base_query=x0,
-                                neighbors=neighbor_pool,
-                                exemplar=exemplar,
-                                bundle=bundle,
-                                config=config,
-                                constraints=constraints,
-                                clf=clf,
-                            )
-
-                            method_candidates = [
-                                ("nn_positive_train", 0.0, None, None),
-                                ("knn_mean_k5", 0.0, None, None),
-                                ("projection_only", 1.0, False, True),
-                                ("fixed_blend", fixed_alpha, False, True),
-                                ("fixed_blend_no_repair", fixed_alpha, False, False),
-                                ("learned_alpha", learned_alpha, False, True),
-                                ("rule_router", rule_alpha, False, True),
-                                ("learned_router", router_alpha, False, True),
-                                ("learned_router_no_shift", router_no_shift_alpha, False, True),
-                                ("learned_router_no_geometry", router_no_geometry_alpha, False, True),
-                                ("utility_router", utility_router_alpha, False, True),
-                                ("utility_router_guarded", utility_router_guarded_alpha, False, True),
-                                ("utility_router_no_shift", utility_router_no_shift_alpha, False, True),
-                                ("utility_router_no_geometry", utility_router_no_geometry_alpha, False, True),
-                                ("safe_router", router_alpha, True, True),
-                            ]
-
-                            query_id = f"{dataset_name}|seed={seed}|depth={depth}|constraint={constraints.name}|setting={setting}|row={int(idx)}"
-                            subgroup_value = (
-                                str(row_raw[config.subgroup_raw]) if config.subgroup_raw is not None and config.subgroup_raw in row_raw.index else "NA"
-                            )
-
-                            for method_name, alpha, can_abstain, use_repair in method_candidates:
-                                alpha = float(alpha)
-                                if method_name == "nn_positive_train":
-                                    start = time.perf_counter()
-                                    result = evaluate_candidate(
-                                        method=method_name,
-                                        alpha=alpha,
-                                        base_query=x0,
-                                        candidate=nn_candidate,
-                                        bundle=bundle,
-                                        clf=clf,
-                                        start_time=start,
-                                    )
-                                elif method_name == "knn_mean_k5":
-                                    start = time.perf_counter()
-                                    result = evaluate_candidate(
-                                        method=method_name,
-                                        alpha=alpha,
-                                        base_query=x0,
-                                        candidate=knn_mean_candidate,
-                                        bundle=bundle,
-                                        clf=clf,
-                                        start_time=start,
-                                    )
-                                elif use_repair and any(abs(alpha - grid_alpha) < 1e-9 for grid_alpha in ALPHA_GRID):
-                                    result = clone_action_result(oracle_results[nearest_grid_alpha(alpha)], method_name, alpha)
-                                else:
+                                oracle_results: Dict[float, ActionResult] = {}
+                                for alpha in ALPHA_GRID:
                                     start = time.perf_counter()
                                     candidate = build_alpha_candidate(
                                         base_query=x0,
                                         projection=projection,
                                         exemplar=exemplar,
-                                        alpha=alpha,
+                                        alpha=float(alpha),
                                         bundle=bundle,
                                         config=config,
                                         constraints=constraints,
-                                        clf=clf,
-                                        do_repair=use_repair,
+                                        clf=eval_model,
                                     )
-                                    result = evaluate_candidate(
-                                        method=method_name,
-                                        alpha=alpha,
+                                    oracle_results[float(alpha)] = evaluate_candidate(
+                                        method=f"alpha_{alpha:.2f}",
+                                        alpha=float(alpha),
                                         base_query=x0,
                                         candidate=candidate,
                                         bundle=bundle,
-                                        clf=clf,
+                                        clf=eval_model,
                                         start_time=start,
                                     )
-                                if can_abstain and result.utility > safe_threshold:
-                                    result = evaluate_candidate(
-                                        method=method_name,
-                                        alpha=alpha,
-                                        base_query=x0,
-                                        candidate=None,
-                                        bundle=bundle,
-                                        clf=clf,
-                                        start_time=start,
-                                        abstained=True,
-                                        abstain_penalty=safe_threshold,
-                                    )
+                                oracle_alpha = float(min(oracle_results.items(), key=lambda kv: kv[1].utility)[0])
+                                oracle_utility = float(oracle_results[oracle_alpha].utility)
+                                safe_threshold = float(thresholds["safe_utility_threshold"])
 
-                                if method_name in {"nn_positive_train", "knn_mean_k5"}:
-                                    route_acc = float("nan")
-                                elif result.abstained:
-                                    route_acc = float(oracle_utility >= safe_threshold)
+                                learned_alpha = alpha_prediction(alpha_model, features)
+                                if (
+                                    features["ood_score"] > thresholds["rule_ood_q75"]
+                                    or features["d_proj"] <= 0.90 * max(features["d_nn"], 1e-9)
+                                    or features["repair_needed"] > 0.5
+                                ):
+                                    rule_alpha = 1.0
                                 else:
-                                    route_acc = float(abs(nearest_grid_alpha(alpha) - oracle_alpha) < 1e-9)
-
-                                query_rows.append(
-                                    {
-                                        "query_id": query_id,
-                                        "dataset": dataset_name,
-                                        "seed": seed,
-                                        "depth": depth,
-                                        "setting": setting,
-                                        "constraint": constraints.name,
-                                        "subgroup": subgroup_value,
-                                        "method": method_name,
-                                        "valid": float(result.valid),
-                                        "abstained": float(result.abstained),
-                                        "cost_l1": result.cost_l1,
-                                        "cost_l2": result.cost_l2,
-                                        "sparsity": result.sparsity,
-                                        "plausibility": result.plausibility,
-                                        "utility": result.utility,
-                                        "regret": float(result.utility - oracle_utility),
-                                        "route_accuracy": route_acc,
-                                        "runtime_sec": result.runtime_sec,
-                                        "chosen_alpha": alpha,
-                                        "oracle_alpha": oracle_alpha,
-                                        "oracle_utility": oracle_utility,
-                                        "projection_route": float(abs(alpha - 1.0) < 1e-9),
-                                    }
+                                    rule_alpha = fixed_alpha
+                                router_alpha = (
+                                    1.0 if router_prediction(router_models["main"], features, FULL_FEATURE_ORDER) == 1 else fixed_alpha
                                 )
+                                router_no_shift_alpha = (
+                                    1.0 if router_prediction(router_models["no_shift"], features, NO_SHIFT_FEATURE_ORDER) == 1 else fixed_alpha
+                                )
+                                router_no_geometry_alpha = (
+                                    1.0
+                                    if router_prediction(router_models["no_geometry"], features, NO_GEOMETRY_FEATURE_ORDER) == 1
+                                    else fixed_alpha
+                                )
+                                utility_router_alpha = (
+                                    1.0
+                                    if utility_route_prediction(utility_models["main"], features, FULL_FEATURE_ORDER) == 1
+                                    else fixed_alpha
+                                )
+                                utility_router_no_shift_alpha = (
+                                    1.0
+                                    if utility_route_prediction(utility_models["no_shift"], features, NO_SHIFT_FEATURE_ORDER) == 1
+                                    else fixed_alpha
+                                )
+                                utility_router_no_geometry_alpha = (
+                                    1.0
+                                    if utility_route_prediction(utility_models["no_geometry"], features, NO_GEOMETRY_FEATURE_ORDER) == 1
+                                    else fixed_alpha
+                                )
+                                pred_proj_u, pred_blend_u = predict_route_utilities(
+                                    utility_models["main"], features, FULL_FEATURE_ORDER
+                                )
+                                proj_valid = bool(oracle_results[1.0].valid)
+                                fixed_valid = bool(oracle_results[nearest_grid_alpha(fixed_alpha)].valid)
+                                utility_router_guarded_alpha = utility_router_alpha
+                                if abs(utility_router_guarded_alpha - 1.0) < 1e-9 and (not proj_valid) and fixed_valid:
+                                    utility_router_guarded_alpha = fixed_alpha
+                                elif abs(utility_router_guarded_alpha - fixed_alpha) < 1e-9 and (not fixed_valid) and proj_valid:
+                                    utility_router_guarded_alpha = 1.0
+                                if abs(utility_router_guarded_alpha - nearest_grid_alpha(utility_router_guarded_alpha)) < 1e-9:
+                                    guarded_result_cached = clone_action_result(
+                                        oracle_results[nearest_grid_alpha(utility_router_guarded_alpha)],
+                                        "utility_router_guarded",
+                                        utility_router_guarded_alpha,
+                                    )
+                                else:
+                                    guarded_candidate = build_alpha_candidate(
+                                        base_query=x0,
+                                        projection=projection,
+                                        exemplar=exemplar,
+                                        alpha=utility_router_guarded_alpha,
+                                        bundle=bundle,
+                                        config=config,
+                                        constraints=constraints,
+                                        clf=eval_model,
+                                        do_repair=True,
+                                    )
+                                    guarded_result_cached = evaluate_candidate(
+                                        method="utility_router_guarded",
+                                        alpha=utility_router_guarded_alpha,
+                                        base_query=x0,
+                                        candidate=guarded_candidate,
+                                        bundle=bundle,
+                                        clf=eval_model,
+                                        start_time=time.perf_counter(),
+                                    )
+                                nn_candidate = build_nn_candidate(
+                                    base_query=x0,
+                                    exemplar=exemplar,
+                                    bundle=bundle,
+                                    config=config,
+                                    constraints=constraints,
+                                )
+                                knn_mean_candidate = build_knn_mean_candidate(
+                                    base_query=x0,
+                                    neighbors=neighbor_pool,
+                                    exemplar=exemplar,
+                                    bundle=bundle,
+                                    config=config,
+                                    constraints=constraints,
+                                    clf=eval_model,
+                                )
+
+                                should_escalate_exact = bool(
+                                    enable_exact_cascade
+                                    and pulp is not None
+                                    and (
+                                        abs(pred_proj_u - pred_blend_u) <= thresholds["exact_margin_q25"]
+                                        or ((not proj_valid) and (not fixed_valid))
+                                        or (features["repair_needed"] > 0.5 and features["ood_score"] > thresholds["rule_ood_q75"])
+                                    )
+                                )
+                                exact_candidate: Optional[np.ndarray] = None
+                                exact_result: Optional[ActionResult] = None
+                                accepted_exact = False
+
+                                method_candidates = [
+                                    ("nn_positive_train", 0.0, None, None),
+                                    ("knn_mean_k5", 0.0, None, None),
+                                    ("projection_only", 1.0, False, True),
+                                    ("fixed_blend", fixed_alpha, False, True),
+                                    ("fixed_blend_no_repair", fixed_alpha, False, False),
+                                    ("learned_alpha", learned_alpha, False, True),
+                                    ("rule_router", rule_alpha, False, True),
+                                    ("learned_router", router_alpha, False, True),
+                                    ("learned_router_no_shift", router_no_shift_alpha, False, True),
+                                    ("learned_router_no_geometry", router_no_geometry_alpha, False, True),
+                                    ("utility_router", utility_router_alpha, False, True),
+                                    ("utility_router_guarded", utility_router_guarded_alpha, False, True),
+                                    ("utility_router_no_shift", utility_router_no_shift_alpha, False, True),
+                                    ("utility_router_no_geometry", utility_router_no_geometry_alpha, False, True),
+                                    ("safe_router", router_alpha, True, True),
+                                ]
+                                if include_exact_baseline:
+                                    method_candidates.append(("exact_tree_milp", -1.0, False, True))
+                                if enable_exact_cascade:
+                                    method_candidates.append(("cascade_exact_auto", utility_router_guarded_alpha, False, True))
+
+                                query_id = (
+                                    f"{dataset_name}|model={model_family}|seed={seed}|depth={depth}|"
+                                    f"constraint={constraints.name}|setting={setting}|row={int(idx)}"
+                                )
+                                subgroup_value = (
+                                    str(row_raw[config.subgroup_raw]) if config.subgroup_raw is not None and config.subgroup_raw in row_raw.index else "NA"
+                                )
+
+                                for method_name, alpha, can_abstain, use_repair in method_candidates:
+                                    alpha = float(alpha)
+                                    if method_name == "nn_positive_train":
+                                        start = time.perf_counter()
+                                        result = evaluate_candidate(
+                                            method=method_name,
+                                            alpha=alpha,
+                                            base_query=x0,
+                                            candidate=nn_candidate,
+                                            bundle=bundle,
+                                            clf=eval_model,
+                                            start_time=start,
+                                        )
+                                    elif method_name == "knn_mean_k5":
+                                        start = time.perf_counter()
+                                        result = evaluate_candidate(
+                                            method=method_name,
+                                            alpha=alpha,
+                                            base_query=x0,
+                                            candidate=knn_mean_candidate,
+                                            bundle=bundle,
+                                            clf=eval_model,
+                                            start_time=start,
+                                        )
+                                    elif method_name == "exact_tree_milp":
+                                        start = time.perf_counter()
+                                        if exact_candidate is None:
+                                            exact_candidate = best_exact_candidate(
+                                                base_query=x0,
+                                                eval_model=eval_model,
+                                                leaf_boxes=leaf_boxes,
+                                                positive_leaf_nodes=positive_leaf_nodes,
+                                                bundle=bundle,
+                                                config=config,
+                                                constraints=constraints,
+                                                time_limit_sec=float(exact_time_limit_sec),
+                                            )
+                                        if exact_result is None:
+                                            exact_result = evaluate_candidate(
+                                                method=method_name,
+                                                alpha=alpha,
+                                                base_query=x0,
+                                                candidate=exact_candidate,
+                                                bundle=bundle,
+                                                clf=eval_model,
+                                                start_time=start,
+                                            )
+                                        result = clone_action_result(exact_result, method_name, alpha)
+                                    elif method_name == "cascade_exact_auto":
+                                        if should_escalate_exact:
+                                            start = time.perf_counter()
+                                            if exact_candidate is None:
+                                                exact_candidate = best_exact_candidate(
+                                                    base_query=x0,
+                                                    eval_model=eval_model,
+                                                    leaf_boxes=leaf_boxes,
+                                                    positive_leaf_nodes=positive_leaf_nodes,
+                                                    bundle=bundle,
+                                                    config=config,
+                                                    constraints=constraints,
+                                                    time_limit_sec=float(exact_time_limit_sec),
+                                                )
+                                            if exact_result is None:
+                                                exact_result = evaluate_candidate(
+                                                    method="exact_tree_milp",
+                                                    alpha=alpha,
+                                                    base_query=x0,
+                                                    candidate=exact_candidate,
+                                                    bundle=bundle,
+                                                    clf=eval_model,
+                                                    start_time=start,
+                                                )
+                                            if exact_result.valid and exact_result.utility + 1e-9 < guarded_result_cached.utility:
+                                                accepted_exact = True
+                                                result = clone_action_result(
+                                                    exact_result,
+                                                    method_name,
+                                                    alpha,
+                                                    runtime_sec=exact_result.runtime_sec,
+                                                )
+                                            else:
+                                                result = clone_action_result(
+                                                    guarded_result_cached,
+                                                    method_name,
+                                                    alpha,
+                                                    runtime_sec=exact_result.runtime_sec,
+                                                )
+                                        else:
+                                            result = clone_action_result(guarded_result_cached, method_name, alpha)
+                                    elif method_name == "utility_router_guarded":
+                                        result = clone_action_result(guarded_result_cached, method_name, alpha)
+                                    elif use_repair and any(abs(alpha - grid_alpha) < 1e-9 for grid_alpha in ALPHA_GRID):
+                                        result = clone_action_result(oracle_results[nearest_grid_alpha(alpha)], method_name, alpha)
+                                    else:
+                                        start = time.perf_counter()
+                                        candidate = build_alpha_candidate(
+                                            base_query=x0,
+                                            projection=projection,
+                                            exemplar=exemplar,
+                                            alpha=alpha,
+                                            bundle=bundle,
+                                            config=config,
+                                            constraints=constraints,
+                                            clf=eval_model,
+                                            do_repair=use_repair,
+                                        )
+                                        result = evaluate_candidate(
+                                            method=method_name,
+                                            alpha=alpha,
+                                            base_query=x0,
+                                            candidate=candidate,
+                                            bundle=bundle,
+                                            clf=eval_model,
+                                            start_time=start,
+                                        )
+                                    if can_abstain and result.utility > safe_threshold:
+                                        result = evaluate_candidate(
+                                            method=method_name,
+                                            alpha=alpha,
+                                            base_query=x0,
+                                            candidate=None,
+                                            bundle=bundle,
+                                            clf=eval_model,
+                                            start_time=start,
+                                            abstained=True,
+                                            abstain_penalty=safe_threshold,
+                                        )
+
+                                    if method_name in {"nn_positive_train", "knn_mean_k5"}:
+                                        route_acc = float("nan")
+                                    elif result.abstained:
+                                        route_acc = float(oracle_utility >= safe_threshold)
+                                    else:
+                                        route_acc = float(abs(nearest_grid_alpha(alpha) - oracle_alpha) < 1e-9)
+
+                                    query_rows.append(
+                                        {
+                                            "query_id": query_id,
+                                            "dataset": dataset_name,
+                                            "model_family": model_family,
+                                            "seed": seed,
+                                            "depth": depth,
+                                            "setting": setting,
+                                            "constraint": constraints.name,
+                                            "subgroup": subgroup_value,
+                                            "method": method_name,
+                                            "valid": float(result.valid),
+                                            "abstained": float(result.abstained),
+                                            "cost_l1": result.cost_l1,
+                                            "cost_l2": result.cost_l2,
+                                            "sparsity": result.sparsity,
+                                            "plausibility": result.plausibility,
+                                            "utility": result.utility,
+                                            "regret": float(result.utility - oracle_utility),
+                                            "route_accuracy": route_acc,
+                                            "runtime_sec": result.runtime_sec,
+                                            "chosen_alpha": alpha,
+                                            "oracle_alpha": oracle_alpha,
+                                            "oracle_utility": oracle_utility,
+                                            "projection_route": float(abs(alpha - 1.0) < 1e-9),
+                                            "escalated_exact": float(method_name == "cascade_exact_auto" and should_escalate_exact),
+                                            "accepted_exact": float(method_name == "cascade_exact_auto" and accepted_exact),
+                                        }
+                                    )
 
     query_df = pd.DataFrame(query_rows)
     tuning_df = pd.DataFrame(tuning_rows)
@@ -1581,10 +1991,11 @@ def run_experiment(
     subgroup_summary_df, subgroup_disparity_df = summarize_subgroups(query_df) if not query_df.empty else (pd.DataFrame(), pd.DataFrame())
     overview = {
         "datasets": list(dataset_names),
+        "model_families": list(model_families),
         "seeds": [int(x) for x in seeds],
         "depths": [int(x) for x in depths],
         "settings": SETTINGS,
-        "constraints": [R1_ALL_MUTABLE.name, R2_REALISTIC.name],
+        "constraints": [c.name for c in constraint_settings],
         "alpha_grid": ALPHA_GRID,
         "n_query_rows": int(len(query_df)),
         "n_tuning_rows": int(len(tuning_df)),
@@ -1604,10 +2015,15 @@ def run_experiment(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Adaptive recourse routing pilot runner.")
     parser.add_argument("--datasets", nargs="+", default=["adult", "german", "bank"])
+    parser.add_argument("--model-families", nargs="+", default=DEFAULT_MODEL_FAMILIES)
+    parser.add_argument("--constraints", nargs="+", default=[R1_ALL_MUTABLE.name, R2_REALISTIC.name])
     parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
     parser.add_argument("--depths", nargs="+", type=int, default=DEFAULT_DEPTHS)
     parser.add_argument("--max-rows", type=int, default=5000)
     parser.add_argument("--exp-name", type=str, default=DEFAULT_EXP_NAME)
+    parser.add_argument("--enable-exact-cascade", action="store_true")
+    parser.add_argument("--include-exact-baseline", action="store_true")
+    parser.add_argument("--exact-time-limit-sec", type=float, default=3.0)
     args = parser.parse_args()
 
     exp_dir = ROOT / "exp" / args.exp_name
@@ -1615,11 +2031,16 @@ def main() -> None:
     ensure_dirs(exp_dir, fig_dir)
     query_df, summary_df, extras = run_experiment(
         dataset_names=args.datasets,
+        model_families=args.model_families,
+        constraint_settings=get_constraint_settings(args.constraints),
         seeds=args.seeds,
         depths=args.depths,
         max_rows=int(args.max_rows),
         exp_dir=exp_dir,
         fig_dir=fig_dir,
+        enable_exact_cascade=bool(args.enable_exact_cascade),
+        include_exact_baseline=bool(args.include_exact_baseline),
+        exact_time_limit_sec=float(args.exact_time_limit_sec),
     )
 
     query_df.to_csv(exp_dir / "query_results.csv", index=False)

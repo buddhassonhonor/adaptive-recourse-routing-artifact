@@ -1,0 +1,7 @@
+dataset,model_family,seed,depth,constraint,fixed_alpha,rule_ood_q75,safe_utility_threshold,exact_margin_q25,n_calibration_queries
+adult,tree,7,3,r2_realistic,1.0,2.5827061620290195,3.014416656493219,0.0,66
+adult,tree,13,3,r2_realistic,1.0,2.457512796984029,4.80177320480438,0.0,93
+bank,tree,7,3,r2_realistic,0.25,2.852477344657233,4.071649757035558,4.9760596682616764,61
+bank,tree,13,3,r2_realistic,1.0,2.636027424746132,1.5364042062261367,0.0,69
+compas,tree,7,3,r2_realistic,1.0,2.2147163529448237,2.5303678495211988,0.0,70
+compas,tree,13,3,r2_realistic,1.0,2.0449995954070284,2.7563613468598525,0.0,51

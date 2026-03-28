@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import pandas as pd
 
 
@@ -59,6 +60,9 @@ def main() -> None:
         "r1_all_mutable": "All-Mutable Constraints",
     }
 
+    handles: list[Line2D] = []
+    seen_methods: set[str] = set()
+
     for ax, constraint in zip(axes, constraint_order):
         part = df[df["constraint"] == constraint].copy()
         part = part.sort_values("utility")
@@ -69,14 +73,24 @@ def main() -> None:
                 row["utility"],
                 s=130,
                 color=METHOD_COLORS.get(method, "#333333"),
+                edgecolors="white",
+                linewidths=0.8,
             )
-            ax.text(
-                row["runtime_ms"] * 1.08,
-                row["utility"],
-                METHOD_LABELS.get(method, method),
-                fontsize=12,
-                va="center",
-            )
+            if method not in seen_methods:
+                handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="o",
+                        color="none",
+                        markerfacecolor=METHOD_COLORS.get(method, "#333333"),
+                        markeredgecolor="white",
+                        markeredgewidth=0.8,
+                        markersize=9,
+                        label=METHOD_LABELS.get(method, method),
+                    )
+                )
+                seen_methods.add(method)
         ax.set_xscale("log")
         ax.set_xlabel("Mean runtime per query (ms, log scale)")
         ax.set_title(title_map[constraint])
@@ -84,7 +98,14 @@ def main() -> None:
 
     axes[0].set_ylabel("Mean recourse utility")
     fig.suptitle("External baseline quality-speed frontier", fontsize=20)
-    plt.tight_layout()
+    fig.legend(
+        handles=handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.02),
+        ncol=4,
+        frameon=False,
+    )
+    plt.tight_layout(rect=(0, 0.08, 1, 0.95))
     plt.savefig(out_path, dpi=100)
     plt.close(fig)
     print(out_path)

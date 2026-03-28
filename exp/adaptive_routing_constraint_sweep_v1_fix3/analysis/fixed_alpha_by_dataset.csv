@@ -1,0 +1,17 @@
+dataset,constraint,mean,median,min,max
+adult,r1_all_mutable,0.25,0.25,0.25,0.25
+adult,r1_immutable_only,0.25,0.25,0.25,0.25
+adult,r1_structural,0.25,0.25,0.25,0.25
+adult,r2_realistic,0.25,0.25,0.25,0.25
+bank,r1_all_mutable,0.25,0.25,0.25,0.25
+bank,r1_immutable_only,0.6833333333333332,0.9,0.25,0.9
+bank,r1_structural,0.9666666666666667,1.0,0.9,1.0
+bank,r2_realistic,0.9666666666666667,1.0,0.9,1.0
+compas,r1_all_mutable,0.7166666666666667,0.9,0.25,1.0
+compas,r1_immutable_only,0.9666666666666667,1.0,0.9,1.0
+compas,r1_structural,0.9666666666666667,1.0,0.9,1.0
+compas,r2_realistic,0.9666666666666667,1.0,0.9,1.0
+german,r1_all_mutable,0.25,0.25,0.25,0.25
+german,r1_immutable_only,0.25,0.25,0.25,0.25
+german,r1_structural,0.8333333333333334,1.0,0.5,1.0
+german,r2_realistic,0.8333333333333334,1.0,0.5,1.0
